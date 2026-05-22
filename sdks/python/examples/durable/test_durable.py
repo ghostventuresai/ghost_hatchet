@@ -55,9 +55,9 @@ async def test_durable_workflow(hatchet: Hatchet) -> None:
 
     workers = await hatchet.workers.aio_list()
 
-    assert workers.rows
+    assert workers
 
-    active_workers = [w for w in workers.rows if w.status == "ACTIVE"]
+    active_workers = [w for w in workers if w.status == "ACTIVE"]
 
     assert any(
         w.name == hatchet.config.apply_namespace("e2e-test-worker")
@@ -76,10 +76,8 @@ async def test_durable_workflow(hatchet: Hatchet) -> None:
     wait_group_1 = result["wait_for_or_group_1"]
     wait_group_2 = result["wait_for_or_group_2"]
 
-    assert wait_group_1["key"] == wait_group_2["key"]
-    assert wait_group_1["key"] == "CREATE"
-    assert "sleep" in wait_group_1["event_id"]
-    assert "event" in wait_group_2["event_id"]
+    assert wait_group_1["resolved"] == "sleep"
+    assert "event" in wait_group_2["resolved"]
 
 
 @requires_durable_eviction

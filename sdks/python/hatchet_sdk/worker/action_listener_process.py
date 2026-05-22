@@ -3,7 +3,6 @@ import contextlib
 import logging
 import signal
 import time
-import warnings
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -17,7 +16,6 @@ from aiohttp.web_response import Response
 from grpc.aio import UnaryUnaryCall
 from prometheus_client import Gauge, generate_latest
 
-from hatchet_sdk.client import Client
 from hatchet_sdk.clients.dispatcher.action_listener import ActionListener
 from hatchet_sdk.clients.dispatcher.dispatcher import DispatcherClient
 from hatchet_sdk.clients.rest.models.update_worker_request import UpdateWorkerRequest
@@ -27,6 +25,7 @@ from hatchet_sdk.contracts.dispatcher_pb2 import (
     ActionEventResponse,
     StepActionEvent,
 )
+from hatchet_sdk.features.workers import WorkersClient
 from hatchet_sdk.logger import logger
 from hatchet_sdk.runnables.action import Action, ActionType
 from hatchet_sdk.runnables.contextvars import (
@@ -71,7 +70,6 @@ class WorkerActionListenerProcess:
         action_queue: "Queue[Action]",
         event_queue: "Queue[ActionEvent | STOP_LOOP_TYPE]",
         handle_kill: bool,
-        debug: bool,
         labels: list[WorkerLabel],
     ) -> None:
         self.name = name
@@ -82,7 +80,6 @@ class WorkerActionListenerProcess:
         self.config = config
         self.action_queue = action_queue
         self.event_queue = event_queue
-        self.debug = debug
         self.labels = labels
         self.handle_kill = handle_kill
 
@@ -104,11 +101,10 @@ class WorkerActionListenerProcess:
             asyncio.Task[UnaryUnaryCall[StepActionEvent, ActionEventResponse] | None]
         ] = set()
 
-        if self.debug:
+        if self.config.debug:
             logger.setLevel(logging.DEBUG)
 
-        self.client = Client(config=self.config, debug=self.debug)
-
+        self._workers_client = WorkersClient(self.config)
         loop = asyncio.get_event_loop()
         loop.add_signal_handler(
             signal.SIGINT, lambda: asyncio.create_task(self.pause_task_assignment())
@@ -129,24 +125,6 @@ class WorkerActionListenerProcess:
                 "hatchet_worker_event_loop_lag_seconds",
                 "Event loop lag in seconds (listener process)",
             )
-
-    @property
-    def slots(self) -> int:
-        warnings.warn(
-            "WorkerActionListenerProcess.slots is deprecated; use slot_config['default'] instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._slots
-
-    @property
-    def durable_slots(self) -> int:
-        warnings.warn(
-            "WorkerActionListenerProcess.durable_slots is deprecated; use slot_config['durable'] instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._durable_slots
 
     async def _monitor_event_loop(self) -> None:
         # If the loop is blocked, this coroutine itself can't run; when it resumes,
@@ -315,7 +293,7 @@ class WorkerActionListenerProcess:
         if self.listener is None:
             raise ValueError("listener not started")
 
-        await self.client.workers.aio_update(
+        await self._workers_client.aio_update(
             worker_id=self.listener.worker_id,
             opts=UpdateWorkerRequest(isPaused=True),
         )
@@ -536,7 +514,6 @@ def worker_action_listener_process(
     action_queue: "Queue[Action]",
     event_queue: "Queue[ActionEvent | STOP_LOOP_TYPE]",
     handle_kill: bool,
-    debug: bool,
     labels: list[WorkerLabel],
 ) -> None:
     async def run() -> None:
@@ -548,7 +525,6 @@ def worker_action_listener_process(
             action_queue=action_queue,
             event_queue=event_queue,
             handle_kill=handle_kill,
-            debug=debug,
             labels=labels,
         )
         await process.start_health_server()
