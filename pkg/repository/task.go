@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,6 +149,17 @@ type TaskIdInsertedAtSignalKey struct {
 	SignalKey string
 }
 
+type TaskBatchAssignment struct {
+	TaskID         int64
+	TaskInsertedAt time.Time
+	BatchIndex     int
+}
+
+type TaskWithRuntime struct {
+	Task    *sqlcv1.V1Task
+	Runtime *sqlcv1.V1TaskRuntime
+}
+
 type CompleteTaskOpts struct {
 	*TaskIdInsertedAtRetryCount
 
@@ -247,7 +259,7 @@ type TaskRepository interface {
 
 	CancelTasks(ctx context.Context, tenantId uuid.UUID, tasks []TaskIdInsertedAtRetryCount) (*FinalizedTaskResponse, error)
 
-	ListTasks(ctx context.Context, tenantId uuid.UUID, tasks []int64) ([]*sqlcv1.V1Task, error)
+	ListTasks(ctx context.Context, tenantId uuid.UUID, tasks []int64) ([]*TaskWithRuntime, error)
 
 	ListTaskMetas(ctx context.Context, tenantId uuid.UUID, tasks []int64) ([]*sqlcv1.ListTaskMetasRow, error)
 
@@ -265,6 +277,8 @@ type TaskRepository interface {
 
 	ProcessTaskRetryQueueItems(ctx context.Context, tenantId uuid.UUID) ([]*sqlcv1.V1RetryQueueItem, bool, error)
 
+	ProcessBatchedQueueItemTimeouts(ctx context.Context, tenantId string) (int, bool, error)
+
 	ProcessDurableSleeps(ctx context.Context, tenantId uuid.UUID) (*EventMatchResults, bool, error)
 
 	GetQueueCounts(ctx context.Context, tenantId uuid.UUID) (map[string]interface{}, error)
@@ -281,6 +295,10 @@ type TaskRepository interface {
 
 	ListSignalCompletedEvents(ctx context.Context, tenantId uuid.UUID, tasks []TaskIdInsertedAtSignalKey) ([]*V1TaskEventWithPayload, error)
 
+	CountActiveTaskBatchRuns(ctx context.Context, tenantId, stepId, batchKey string) (int, error)
+	ReserveTaskBatchRun(ctx context.Context, tenantId, stepId, actionId, batchKey, batchId string, maxRuns int) (bool, error)
+	DeleteTaskBatchRun(ctx context.Context, tenantId, batchId string) error
+
 	// AnalyzeTaskTables runs ANALYZE on the task tables
 	AnalyzeTaskTables(ctx context.Context) error
 
@@ -290,6 +308,7 @@ type TaskRepository interface {
 
 	GetTaskStats(ctx context.Context, tenantId uuid.UUID) (map[string]TaskStat, error)
 
+	UpdateTaskBatchMetadata(ctx context.Context, tenantId, batchId, workerId, batchKey string, batchSize int, assignments []TaskBatchAssignment) error
 	FindOldestRunningTaskInsertedAt(ctx context.Context) (*time.Time, error)
 
 	FindOldestTaskInsertedAt(ctx context.Context) (*time.Time, error)
@@ -1119,15 +1138,87 @@ func (r *sharedRepository) cancelTasks(ctx context.Context, dbtx sqlcv1.DBTX, te
 	}, nil
 }
 
-func (r *TaskRepositoryImpl) ListTasks(ctx context.Context, tenantId uuid.UUID, tasks []int64) ([]*sqlcv1.V1Task, error) {
+func (r *TaskRepositoryImpl) ListTasks(ctx context.Context, tenantId uuid.UUID, tasks []int64) ([]*TaskWithRuntime, error) {
 	return r.listTasks(ctx, r.pool, tenantId, tasks)
 }
 
-func (r *sharedRepository) listTasks(ctx context.Context, dbtx sqlcv1.DBTX, tenantId uuid.UUID, tasks []int64) ([]*sqlcv1.V1Task, error) {
-	return r.queries.ListTasks(ctx, dbtx, sqlcv1.ListTasksParams{
-		TenantID: tenantId,
+func (r *sharedRepository) listTasks(ctx context.Context, dbtx sqlcv1.DBTX, tenantId uuid.UUID, tasks []int64) ([]*TaskWithRuntime, error) {
+	rows, err := r.queries.ListTasks(ctx, dbtx, sqlcv1.ListTasksParams{
+		Tenantid: tenantId,
 		Ids:      tasks,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*TaskWithRuntime, 0, len(rows))
+
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+
+		task := &sqlcv1.V1Task{
+			ID:                           row.ID,
+			InsertedAt:                   row.InsertedAt,
+			TenantID:                     row.TenantID,
+			Queue:                        row.Queue,
+			ActionID:                     row.ActionID,
+			StepID:                       row.StepID,
+			StepReadableID:               row.StepReadableID,
+			WorkflowID:                   row.WorkflowID,
+			WorkflowVersionID:            row.WorkflowVersionID,
+			WorkflowRunID:                row.WorkflowRunID,
+			ScheduleTimeout:              row.ScheduleTimeout,
+			StepTimeout:                  row.StepTimeout,
+			Priority:                     row.Priority,
+			Sticky:                       row.Sticky,
+			DesiredWorkerID:              row.DesiredWorkerID,
+			ExternalID:                   row.ExternalID,
+			DisplayName:                  row.DisplayName,
+			Input:                        row.Input,
+			RetryCount:                   row.RetryCount,
+			InternalRetryCount:           row.InternalRetryCount,
+			AppRetryCount:                row.AppRetryCount,
+			StepIndex:                    row.StepIndex,
+			AdditionalMetadata:           row.AdditionalMetadata,
+			DagID:                        row.DagID,
+			DagInsertedAt:                row.DagInsertedAt,
+			ParentTaskExternalID:         row.ParentTaskExternalID,
+			ParentTaskID:                 row.ParentTaskID,
+			ParentTaskInsertedAt:         row.ParentTaskInsertedAt,
+			ChildIndex:                   row.ChildIndex,
+			ChildKey:                     row.ChildKey,
+			InitialState:                 row.InitialState,
+			InitialStateReason:           row.InitialStateReason,
+			ConcurrencyParentStrategyIds: row.ConcurrencyParentStrategyIds,
+			ConcurrencyStrategyIds:       row.ConcurrencyStrategyIds,
+			ConcurrencyKeys:              row.ConcurrencyKeys,
+			RetryBackoffFactor:           row.RetryBackoffFactor,
+			RetryMaxBackoff:              row.RetryMaxBackoff,
+		}
+
+		var runtime *sqlcv1.V1TaskRuntime
+
+		runtime = &sqlcv1.V1TaskRuntime{
+			TaskID:         row.ID,
+			TaskInsertedAt: row.InsertedAt,
+			RetryCount:     row.RetryCount,
+			WorkerID:       row.RuntimeWorkerID,
+			BatchID:        row.RuntimeBatchID,
+			BatchSize:      row.RuntimeBatchSize,
+			BatchIndex:     row.RuntimeBatchIndex,
+			TenantID:       row.TenantID,
+			TimeoutAt:      row.RuntimeTimeoutAt,
+		}
+
+		result = append(result, &TaskWithRuntime{
+			Task:    task,
+			Runtime: runtime,
+		})
+	}
+
+	return result, nil
 }
 
 func (r *TaskRepositoryImpl) listTaskOutputEvents(ctx context.Context, tx sqlcv1.DBTX, tenantId uuid.UUID, taskExternalIds []uuid.UUID) ([]*TaskOutputEvent, error) {
@@ -1262,10 +1353,68 @@ func (r *TaskRepositoryImpl) ProcessTaskTimeouts(ctx context.Context, tenantId u
 		}, false, nil
 	}
 
+	// Check for batched tasks and collect all tasks in affected batches
+	batchIdsToFail := make(map[string]bool)
+	taskIdsToFail := make(map[string]bool) // key is "taskId:retryCount"
+
+	for _, task := range toTimeout {
+		taskKey := fmt.Sprintf("%d:%d", task.ID, task.RetryCount)
+		taskIdsToFail[taskKey] = true
+
+		// If this task is part of a batch, we need to fail the entire batch
+		if task.BatchID != nil {
+			batchId := task.BatchID.String()
+			if batchId != "" {
+				batchIdsToFail[batchId] = true
+			}
+		}
+	}
+
+	// For each batch that has a timed-out task, get all tasks in that batch and add them to the fail list
+	for batchId := range batchIdsToFail {
+		bId, batchIdErr := uuid.Parse(batchId)
+		if batchIdErr != nil {
+			return nil, false, fmt.Errorf("failed to parse batch id %s: %w", batchId, batchIdErr)
+		}
+
+		batchTasks, err := r.queries.ListTasksInBatch(ctx, tx, sqlcv1.ListTasksInBatchParams{
+			Tenantid: tenantId,
+			Batchid:  bId,
+		})
+
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to list tasks in batch %s: %w", batchId, err)
+		}
+
+		// Add all tasks in the batch to the timeout list if not already present
+		for _, batchTask := range batchTasks {
+			taskKey := fmt.Sprintf("%d:%d", batchTask.ID, batchTask.RetryCount)
+			if !taskIdsToFail[taskKey] {
+				taskIdsToFail[taskKey] = true
+
+				// Add to toTimeout list for cancellation signals
+				toTimeout = append(toTimeout, &sqlcv1.ListTasksToTimeoutRow{
+					ID:            batchTask.ID,
+					InsertedAt:    batchTask.InsertedAt,
+					RetryCount:    batchTask.RetryCount,
+					ExternalID:    batchTask.ExternalID,
+					WorkflowRunID: batchTask.WorkflowRunID,
+					WorkerID:      batchTask.WorkerID,
+					StepTimeout:   pgtype.Text{String: "batch timeout", Valid: true},
+				})
+			}
+		}
+	}
+
 	// parse into FailTaskOpts
 	failOpts := make([]FailTaskOpts, 0, len(toTimeout))
 
 	for _, task := range toTimeout {
+		errorMsg := fmt.Sprintf("Task exceeded timeout of %s", task.StepTimeout.String)
+		if task.BatchID != nil {
+			errorMsg = "Task failed due to batch timeout"
+		}
+
 		failOpts = append(failOpts, FailTaskOpts{
 			TaskIdInsertedAtRetryCount: &TaskIdInsertedAtRetryCount{
 				Id:         task.ID,
@@ -1273,7 +1422,7 @@ func (r *TaskRepositoryImpl) ProcessTaskTimeouts(ctx context.Context, tenantId u
 				RetryCount: task.RetryCount,
 			},
 			IsAppError:     true,
-			ErrorMessage:   fmt.Sprintf("Task exceeded timeout of %s", task.StepTimeout.String),
+			ErrorMessage:   errorMsg,
 			IsNonRetryable: false,
 		})
 	}
@@ -1294,6 +1443,14 @@ func (r *TaskRepositoryImpl) ProcessTaskTimeouts(ctx context.Context, tenantId u
 		FailTasksResponse: failResp,
 		TimeoutTasks:      toTimeout,
 	}, len(toTimeout) == limit, nil
+}
+
+func (r *TaskRepositoryImpl) ProcessBatchedQueueItemTimeouts(ctx context.Context, tenantId string) (int, bool, error) {
+	// NOTE: Batched schedule timeouts are currently handled by the in-memory batch
+	// scheduler, which deletes timed-out rows and emits SCHEDULING_TIMED_OUT events.
+	// This background DB cleanup was causing confusion by deleting rows without
+	// updating task state, so it is intentionally a no-op for now.
+	return 0, false, nil
 }
 
 func (r *TaskRepositoryImpl) ProcessTaskReassignments(ctx context.Context, tenantId uuid.UUID) (*FailTasksResponse, bool, error) {
@@ -1865,6 +2022,7 @@ func (r *sharedRepository) insertTasks(
 	workflowRunIds := make([]uuid.UUID, len(tasks))
 	isDurables := make([]bool, len(tasks))
 	desiredWorkerLabels := make([][]byte, len(tasks))
+	batchKeys := make([]string, len(tasks))
 
 	externalIdToInput := make(map[uuid.UUID][]byte, len(tasks))
 
@@ -1931,6 +2089,60 @@ func (r *sharedRepository) insertTasks(
 
 		if len(task.AdditionalMetadata) > 0 {
 			additionalMetadatas[i] = task.AdditionalMetadata
+		}
+
+		if stepConfig.BatchGroupKey.Valid && stepConfig.BatchGroupKey.String != "" {
+			var additionalMeta map[string]interface{}
+
+			if len(additionalMetadatas[i]) > 0 {
+				if err := json.Unmarshal(additionalMetadatas[i], &additionalMeta); err != nil {
+					return nil, fmt.Errorf("failed to process batch key additional metadata: not a json object")
+				}
+			}
+
+			if task.Input == nil {
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): input is nil", stepConfig.BatchGroupKey.String)
+			}
+
+			res, err := r.celParser.ParseAndEvalStepRun(stepConfig.BatchGroupKey.String, cel.NewInput(
+				cel.WithInput(task.Input.Input),
+				cel.WithAdditionalMetadata(additionalMeta),
+				cel.WithWorkflowRunID(task.ExternalId),
+				cel.WithParents(task.Input.TriggerData),
+			))
+
+			// TODO write an event for failed parse
+
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): %w", stepConfig.BatchGroupKey.String, err)
+			}
+
+			if res.String == nil {
+				prefix := "expected string output for batch key"
+
+				if res.Int != nil {
+					return nil, fmt.Errorf("failed to parse batch group key expression (%s): %s, got int", stepConfig.BatchGroupKey.String, prefix)
+				}
+
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): %s, got unknown type", stepConfig.BatchGroupKey.String, prefix)
+			}
+
+			value := strings.TrimSpace(*res.String)
+
+			if value != "" {
+				r.l.Debug().
+					Str("tenant_id", tenantId.String()).
+					Str("step_id", task.StepId.String()).
+					Str("workflow_run_id", task.WorkflowRunId.String()).
+					Str("external_id", task.ExternalId.String()).
+					Str("batch_key", value).
+					Msg("evaluated batch key for task")
+				batchKeys[i] = value
+			} else {
+				batchKeys[i] = ""
+			}
+		} else {
+			batchKeys[i] = ""
 		}
 
 		if task.DagId != nil && task.DagInsertedAt.Valid {
@@ -2183,6 +2395,7 @@ func (r *sharedRepository) insertTasks(
 				WorkflowVersionIds:           make([]uuid.UUID, 0),
 				WorkflowRunIds:               make([]uuid.UUID, 0),
 				Inputs:                       make([][]byte, 0),
+				BatchKeys:                    make([]string, 0),
 				IsDurables:                   make([]bool, 0),
 				DesiredWorkerLabels:          make([][]byte, 0),
 				TriggeringEventExternalIds:   make([]*uuid.UUID, 0),
@@ -2223,6 +2436,7 @@ func (r *sharedRepository) insertTasks(
 		params.RetryMaxBackoff = append(params.RetryMaxBackoff, retryMaxBackoffs[i])
 		params.WorkflowVersionIds = append(params.WorkflowVersionIds, workflowVersionIds[i])
 		params.WorkflowRunIds = append(params.WorkflowRunIds, workflowRunIds[i])
+		params.BatchKeys = append(params.BatchKeys, batchKeys[i])
 		params.IsDurables = append(params.IsDurables, isDurables[i])
 		params.TriggeringEventExternalIds = append(params.TriggeringEventExternalIds, task.TriggeringEventExternalId)
 
@@ -2269,6 +2483,7 @@ func (r *sharedRepository) insertTasks(
 			input := externalIdToInput[task.ExternalID]
 			withPayload := V1TaskWithPayload{
 				V1Task:  task,
+				Runtime: nil,
 				Payload: input,
 			}
 
@@ -2416,6 +2631,7 @@ func (r *sharedRepository) replayTasks(
 	concurrencyKeys := make([][]string, len(tasks))
 	additionalMetadatas := make([][]byte, len(tasks))
 	queues := make([]string, len(tasks))
+	batchKeys := make([]string, len(tasks))
 
 	externalIdToInput := make(map[uuid.UUID][]byte, len(tasks))
 
@@ -2439,6 +2655,47 @@ func (r *sharedRepository) replayTasks(
 
 		if len(task.AdditionalMetadata) > 0 {
 			additionalMetadatas[i] = task.AdditionalMetadata
+		}
+
+		if stepConfig.BatchGroupKey.Valid && stepConfig.BatchGroupKey.String != "" {
+			var additionalMeta map[string]interface{}
+
+			if len(additionalMetadatas[i]) > 0 {
+				if err := json.Unmarshal(additionalMetadatas[i], &additionalMeta); err != nil {
+					return nil, fmt.Errorf("failed to process batch key additional metadata: not a json object")
+				}
+			}
+
+			if task.Input == nil {
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): input is nil", stepConfig.BatchGroupKey.String)
+			}
+
+			res, err := r.celParser.ParseAndEvalStepRun(stepConfig.BatchGroupKey.String, cel.NewInput(
+				cel.WithInput(task.Input.Input),
+				cel.WithAdditionalMetadata(additionalMeta),
+				cel.WithWorkflowRunID(task.ExternalId),
+				cel.WithParents(task.Input.TriggerData),
+			))
+
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): %w", stepConfig.BatchGroupKey.String, err)
+			}
+
+			if res.String == nil {
+				prefix := "expected string output for batch key"
+
+				if res.Int != nil {
+					return nil, fmt.Errorf("failed to parse batch group key expression (%s): %s, got int", stepConfig.BatchGroupKey.String, prefix)
+				}
+
+				return nil, fmt.Errorf("failed to parse batch group key expression (%s): %s, got unknown type", stepConfig.BatchGroupKey.String, prefix)
+			}
+
+			value := strings.TrimSpace(*res.String)
+
+			if value != "" {
+				batchKeys[i] = value
+			}
 		}
 
 		if strats, ok := concurrencyStrats[task.StepId]; ok {
@@ -2550,6 +2807,7 @@ func (r *sharedRepository) replayTasks(
 				DesiredWorkerLabels:        make([][]byte, 0),
 				TriggeringEventExternalIds: make([]*uuid.UUID, 0),
 				TriggeringEventKeys:        make([]pgtype.Text, 0),
+				BatchKeys:                  make([]string, 0),
 			}
 		}
 
@@ -2561,6 +2819,7 @@ func (r *sharedRepository) replayTasks(
 		params.InitialStates = append(params.InitialStates, initialStates[i])
 		params.InitialStateReasons = append(params.InitialStateReasons, initialStateReasons[i])
 		params.Concurrencykeys = append(params.Concurrencykeys, concurrencyKeys[i])
+		params.BatchKeys = append(params.BatchKeys, batchKeys[i])
 		params.DesiredWorkerLabels = append(params.DesiredWorkerLabels, task.DesiredWorkerLabel)
 		params.TriggeringEventExternalIds = append(params.TriggeringEventExternalIds, task.TriggeringEventExternalId)
 		if task.TriggeringEventKey != nil {
@@ -2613,6 +2872,7 @@ func (r *sharedRepository) replayTasks(
 			input := externalIdToInput[task.ExternalID]
 			withPayload := V1TaskWithPayload{
 				V1Task:  task,
+				Runtime: nil,
 				Payload: input,
 			}
 			replayResWithPayloads[i] = &withPayload
@@ -4178,6 +4438,115 @@ func (r *TaskRepositoryImpl) GetTaskStats(ctx context.Context, tenantId uuid.UUI
 	}
 
 	return result, nil
+}
+
+func (r *TaskRepositoryImpl) UpdateTaskBatchMetadata(ctx context.Context, tenantId, batchId, workerId, batchKey string, batchSize int, assignments []TaskBatchAssignment) error {
+	if len(assignments) == 0 {
+		return nil
+	}
+
+	ctx, span := telemetry.NewSpan(ctx, "TaskRepositoryImpl.UpdateTaskBatchMetadata")
+	defer span.End()
+
+	taskIds := make([]int64, len(assignments))
+	taskInsertedAts := make([]pgtype.Timestamptz, len(assignments))
+	batchIndexes := make([]int32, len(assignments))
+
+	for i, assignment := range assignments {
+		taskIds[i] = assignment.TaskID
+		taskInsertedAts[i] = sqlchelpers.TimestamptzFromTime(assignment.TaskInsertedAt)
+		batchIndexes[i] = int32(assignment.BatchIndex)
+	}
+
+	err := r.queries.UpdateTaskBatchMetadata(ctx, r.pool, sqlcv1.UpdateTaskBatchMetadataParams{
+		Batchid:         uuid.MustParse(batchId),
+		Batchsize:       int32(batchSize), // nolint: gosec
+		Workerid:        uuid.MustParse(workerId),
+		Batchkey:        batchKey,
+		Tenantid:        uuid.MustParse(tenantId),
+		Taskids:         taskIds,
+		Taskinsertedats: taskInsertedAts,
+		Batchindexes:    batchIndexes,
+	})
+
+	if err != nil {
+		return fmt.Errorf("could not update task batch metadata: %w", err)
+	}
+
+	return nil
+}
+
+func (r *TaskRepositoryImpl) CountActiveTaskBatchRuns(ctx context.Context, tenantId, stepId, batchKey string) (int, error) {
+	ctx, span := telemetry.NewSpan(ctx, "TaskRepositoryImpl.CountActiveTaskBatchRuns")
+	defer span.End()
+
+	count, err := r.queries.CountActiveTaskBatchRuns(ctx, r.pool, sqlcv1.CountActiveTaskBatchRunsParams{
+		Tenantid: uuid.MustParse(tenantId),
+		Stepid:   uuid.MustParse(stepId),
+		Batchkey: batchKey,
+	})
+
+	return int(count), err
+}
+
+func (r *TaskRepositoryImpl) ReserveTaskBatchRun(ctx context.Context, tenantId, stepId, actionId, batchKey, batchId string, maxRuns int) (bool, error) {
+	ctx, span := telemetry.NewSpan(ctx, "TaskRepositoryImpl.ReserveTaskBatchRun")
+	defer span.End()
+
+	reserved, err := r.queries.ReserveTaskBatchRun(ctx, r.pool, sqlcv1.ReserveTaskBatchRunParams{
+		Tenantid: uuid.MustParse(tenantId),
+		Stepid:   uuid.MustParse(stepId),
+		Batchkey: batchKey,
+		Actionid: actionId,
+		Batchid:  uuid.MustParse(batchId),
+		Maxruns:  int32(maxRuns), // nolint: gosec
+	})
+
+	if err != nil {
+		return false, err
+	}
+
+	if reserved {
+		r.l.Info().
+			Str("tenant_id", tenantId).
+			Str("step_id", stepId).
+			Str("action_id", actionId).
+			Str("batch_key", batchKey).
+			Str("batch_id", batchId).
+			Int("max_runs", maxRuns).
+			Msg("reserved task batch run")
+	} else {
+		r.l.Debug().
+			Str("tenant_id", tenantId).
+			Str("step_id", stepId).
+			Str("action_id", actionId).
+			Str("batch_key", batchKey).
+			Int("max_runs", maxRuns).
+			Msg("could not reserve task batch run (limit reached)")
+	}
+
+	return reserved, nil
+}
+
+func (r *TaskRepositoryImpl) DeleteTaskBatchRun(ctx context.Context, tenantId, batchId string) error {
+	ctx, span := telemetry.NewSpan(ctx, "TaskRepositoryImpl.CompleteTaskBatchRun")
+	defer span.End()
+
+	err := r.queries.DeleteTaskBatchRun(ctx, r.pool, sqlcv1.DeleteTaskBatchRunParams{
+		Tenantid: uuid.MustParse(tenantId),
+		Batchid:  uuid.MustParse(batchId),
+	})
+
+	if err != nil {
+		return err
+	}
+
+	r.l.Info().
+		Str("tenant_id", tenantId).
+		Str("batch_id", batchId).
+		Msg("deleted task batch run")
+
+	return nil
 }
 
 func (r *TaskRepositoryImpl) FindOldestRunningTaskInsertedAt(ctx context.Context) (*time.Time, error) {

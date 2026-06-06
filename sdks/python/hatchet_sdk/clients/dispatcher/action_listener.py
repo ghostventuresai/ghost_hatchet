@@ -27,7 +27,12 @@ from hatchet_sdk.contracts.dispatcher_pb2 import (
 )
 from hatchet_sdk.contracts.dispatcher_pb2_grpc import DispatcherStub
 from hatchet_sdk.logger import logger
-from hatchet_sdk.runnables.action import Action, ActionPayload, ActionType
+from hatchet_sdk.runnables.action import (
+    Action,
+    ActionPayload,
+    ActionType,
+    BatchStartPayload,
+)
 from hatchet_sdk.utils.api_auth import create_authorization_header
 from hatchet_sdk.utils.backoff import exp_backoff_sleep
 from hatchet_sdk.utils.proto_enums import convert_proto_enum_to_python
@@ -78,7 +83,7 @@ class ActionListener:
             try:
                 logger.debug("sending heartbeat")
                 # fixme: figure out how to get typing right here
-                await self.aio_client.Heartbeat(  # type: ignore[misc]
+                await self.aio_client.Heartbeat(
                     HeartbeatRequest(
                         worker_id=self.worker_id,
                         heartbeat_at=proto_timestamp_now(),
@@ -198,6 +203,26 @@ class ActionListener:
 
                         action_payload = ActionPayload()
 
+                    batch_start_payload: BatchStartPayload | None = None
+                    batch_start = (
+                        assigned_action.batchStart
+                        if assigned_action.HasField("batchStart")
+                        else None
+                    )
+
+                    if batch_start is not None:
+                        trigger_time = (
+                            batch_start.triggerTime.ToDatetime()
+                            if batch_start.HasField("triggerTime")
+                            else None
+                        )
+
+                        batch_start_payload = BatchStartPayload(
+                            expected_size=batch_start.expectedSize,
+                            trigger_reason=batch_start.triggerReason,
+                            trigger_time=trigger_time,
+                        )
+
                     action = Action(
                         tenant_id=assigned_action.tenant_id,
                         worker_id=self.worker_id,
@@ -229,6 +254,27 @@ class ActionListener:
                         or None,
                         triggering_event_external_id=assigned_action.triggering_event_external_id,
                         triggering_event_key=assigned_action.triggering_event_key,
+                        batch_id=(
+                            assigned_action.batchId
+                            if assigned_action.HasField("batchId")
+                            else None
+                        ),
+                        batch_size=(
+                            assigned_action.batchSize
+                            if assigned_action.HasField("batchSize")
+                            else None
+                        ),
+                        batch_index=(
+                            assigned_action.batchIndex
+                            if assigned_action.HasField("batchIndex")
+                            else None
+                        ),
+                        batch_key=(
+                            assigned_action.batchKey
+                            if assigned_action.batchKey
+                            else None
+                        ),
+                        batch_start=batch_start_payload,
                     )
 
                     yield action

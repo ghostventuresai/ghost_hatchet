@@ -245,6 +245,45 @@ func (q *Queries) CreateStep(ctx context.Context, db DBTX, arg CreateStepParams)
 	return &i, err
 }
 
+const createStepBatchConfig = `-- name: CreateStepBatchConfig :exec
+INSERT INTO "StepBatchConfig" (
+    "stepId",
+    "batchMaxSize",
+    "batchMaxInterval",
+    "batchGroupKey",
+    "batchGroupMaxRuns"
+) VALUES (
+    $1::uuid,
+    $2::integer,
+    $3::integer,
+    $4::text,
+    $5::integer
+) ON CONFLICT ("stepId") DO UPDATE SET
+    "batchMaxSize" = EXCLUDED."batchMaxSize",
+    "batchMaxInterval" = EXCLUDED."batchMaxInterval",
+    "batchGroupKey" = EXCLUDED."batchGroupKey",
+    "batchGroupMaxRuns" = EXCLUDED."batchGroupMaxRuns"
+`
+
+type CreateStepBatchConfigParams struct {
+	Stepid            uuid.UUID   `json:"stepid"`
+	Batchmaxsize      int32       `json:"batchmaxsize"`
+	BatchMaxInterval  pgtype.Int4 `json:"batchMaxInterval"`
+	BatchGroupKey     pgtype.Text `json:"batchGroupKey"`
+	BatchGroupMaxRuns pgtype.Int4 `json:"batchGroupMaxRuns"`
+}
+
+func (q *Queries) CreateStepBatchConfig(ctx context.Context, db DBTX, arg CreateStepBatchConfigParams) error {
+	_, err := db.Exec(ctx, createStepBatchConfig,
+		arg.Stepid,
+		arg.Batchmaxsize,
+		arg.BatchMaxInterval,
+		arg.BatchGroupKey,
+		arg.BatchGroupMaxRuns,
+	)
+	return err
+}
+
 const createStepConcurrency = `-- name: CreateStepConcurrency :one
 INSERT INTO v1_step_concurrency (
     workflow_id,
@@ -1600,7 +1639,8 @@ SELECT
     w."id" as "workflowId",
     COALESCE(wv."defaultPriority", 1) AS "defaultPriority",
     COUNT(se."stepId") as "exprCount",
-    COUNT(sc.id) as "concurrencyCount"
+    COUNT(sc.id) as "concurrencyCount",
+    sbc."batchGroupKey" AS "batchGroupKey"
 FROM
     "Step" s
 JOIN
@@ -1613,13 +1653,15 @@ LEFT JOIN
     v1_step_concurrency sc ON sc.workflow_id = w."id" AND sc.step_id = s."id"
 LEFT JOIN
     "StepExpression" se ON se."stepId" = s."id"
+LEFT JOIN
+    "StepBatchConfig" sbc ON sbc."stepId" = s."id"
 WHERE
     s."id" = ANY($1::uuid[])
     AND w."tenantId" = $2::uuid
     AND w."deletedAt" IS NULL
     AND wv."deletedAt" IS NULL
 GROUP BY
-    s."id", wv."id", w."name", w."id", wv."sticky"
+    s."id", wv."id", w."name", w."id", wv."sticky", sbc."batchGroupKey"
 `
 
 type ListStepsByIdsParams struct {
@@ -1650,6 +1692,7 @@ type ListStepsByIdsRow struct {
 	DefaultPriority       int32              `json:"defaultPriority"`
 	ExprCount             int64              `json:"exprCount"`
 	ConcurrencyCount      int64              `json:"concurrencyCount"`
+	BatchGroupKey         pgtype.Text        `json:"batchGroupKey"`
 }
 
 func (q *Queries) ListStepsByIds(ctx context.Context, db DBTX, arg ListStepsByIdsParams) ([]*ListStepsByIdsRow, error) {
@@ -1684,6 +1727,7 @@ func (q *Queries) ListStepsByIds(ctx context.Context, db DBTX, arg ListStepsById
 			&i.DefaultPriority,
 			&i.ExprCount,
 			&i.ConcurrencyCount,
+			&i.BatchGroupKey,
 		); err != nil {
 			return nil, err
 		}

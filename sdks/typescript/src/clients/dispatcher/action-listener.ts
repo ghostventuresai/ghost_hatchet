@@ -1,4 +1,8 @@
-import { DispatcherClient as PbDispatcherClient, AssignedAction } from '@hatchet/protoc/dispatcher';
+import {
+  DispatcherClient as PbDispatcherClient,
+  AssignedAction,
+  ActionType,
+} from '@hatchet/protoc/dispatcher';
 
 import { Status } from 'nice-grpc';
 import { getGrpcErrorCode } from '@util/grpc-error';
@@ -25,6 +29,17 @@ export type Action = AssignedAction & { readonly key: ActionKey };
 
 export function createAction(assignedAction: AssignedAction): Action {
   const action = assignedAction as Action;
+  if (action.actionType == ActionType.START_BATCH) {
+    const batchKey = action.batchId ?? action.actionId ?? 'unknown';
+    Object.defineProperty(action, 'key', {
+      get(): ActionKey {
+        return `${batchKey}/${action.retryCount ?? 0}`;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    return action;
+  }
   Object.defineProperty(action, 'key', {
     get(): ActionKey {
       return `${this.taskRunExternalId}/${this.retryCount}`;

@@ -206,9 +206,9 @@ func (r *logLineRepositoryImpl) ListLogLines(ctx context.Context, tenantId uuid.
 	}
 
 	// create a map of task id to external id
-	taskIdToTask := make(map[int64]*sqlcv1.V1Task)
+	taskIdToTask := make(map[int64]*TaskWithRuntime)
 	for _, task := range tasks {
-		taskIdToTask[task.ID] = task
+		taskIdToTask[task.Task.ID] = task
 	}
 
 	// attach task external ids to log lines
@@ -223,8 +223,8 @@ func (r *logLineRepositoryImpl) ListLogLines(ctx context.Context, tenantId uuid.
 
 		res[i] = &ListLogLineRow{
 			V1LogLine:       logLine,
-			TaskExternalId:  task.ExternalID,
-			TaskDisplayName: task.DisplayName,
+			TaskExternalId:  task.Task.ExternalID,
+			TaskDisplayName: task.Task.DisplayName,
 		}
 	}
 
