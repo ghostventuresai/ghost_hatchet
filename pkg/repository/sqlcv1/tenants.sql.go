@@ -1153,6 +1153,7 @@ SELECT
     t."slug" as "tenantSlug",
     t."alertMemberEmails" as "alertMemberEmails",
     t."analyticsOptOut" as "analyticsOptOut",
+    t."dataRetentionPeriod" as "dataRetentionPeriod",
     t."version" as "tenantVersion",
     t."environment" as "tenantEnvironment"
 FROM
@@ -1179,10 +1180,11 @@ type PopulateTenantMembersRow struct {
 	TenantUpdatedAt   pgtype.Timestamp         `json:"tenantUpdatedAt"`
 	TenantName        string                   `json:"tenantName"`
 	TenantSlug        string                   `json:"tenantSlug"`
-	AlertMemberEmails bool                     `json:"alertMemberEmails"`
-	AnalyticsOptOut   bool                     `json:"analyticsOptOut"`
-	TenantVersion     TenantMajorEngineVersion `json:"tenantVersion"`
-	TenantEnvironment NullTenantEnvironment    `json:"tenantEnvironment"`
+	AlertMemberEmails   bool                     `json:"alertMemberEmails"`
+	AnalyticsOptOut     bool                     `json:"analyticsOptOut"`
+	DataRetentionPeriod string                   `json:"dataRetentionPeriod"`
+	TenantVersion       TenantMajorEngineVersion `json:"tenantVersion"`
+	TenantEnvironment   NullTenantEnvironment    `json:"tenantEnvironment"`
 }
 
 func (q *Queries) PopulateTenantMembers(ctx context.Context, db DBTX, ids []uuid.UUID) ([]*PopulateTenantMembersRow, error) {
@@ -1210,6 +1212,7 @@ func (q *Queries) PopulateTenantMembers(ctx context.Context, db DBTX, ids []uuid
 			&i.TenantSlug,
 			&i.AlertMemberEmails,
 			&i.AnalyticsOptOut,
+			&i.DataRetentionPeriod,
 			&i.TenantVersion,
 			&i.TenantEnvironment,
 		); err != nil {
@@ -1498,18 +1501,20 @@ SET
     "name" = COALESCE($1::text, "name"),
     "analyticsOptOut" = COALESCE($2::boolean, "analyticsOptOut"),
     "alertMemberEmails" = COALESCE($3::boolean, "alertMemberEmails"),
-    "version" = COALESCE($4::"TenantMajorEngineVersion", "version")
+    "version" = COALESCE($4::"TenantMajorEngineVersion", "version"),
+    "dataRetentionPeriod" = COALESCE($5::text, "dataRetentionPeriod")
 WHERE
-    "id" = $5::uuid
+    "id" = $6::uuid
 RETURNING id, "createdAt", "updatedAt", "deletedAt", version, "uiVersion", name, slug, "analyticsOptOut", "alertMemberEmails", "controllerPartitionId", "workerPartitionId", "dataRetentionPeriod", "schedulerPartitionId", "canUpgradeV1", "onboardingData", environment
 `
 
 type UpdateTenantParams struct {
-	Name              pgtype.Text                  `json:"name"`
-	AnalyticsOptOut   pgtype.Bool                  `json:"analyticsOptOut"`
-	AlertMemberEmails pgtype.Bool                  `json:"alertMemberEmails"`
-	Version           NullTenantMajorEngineVersion `json:"version"`
-	ID                uuid.UUID                    `json:"id"`
+	Name                pgtype.Text                  `json:"name"`
+	AnalyticsOptOut     pgtype.Bool                  `json:"analyticsOptOut"`
+	AlertMemberEmails   pgtype.Bool                  `json:"alertMemberEmails"`
+	Version             NullTenantMajorEngineVersion `json:"version"`
+	DataRetentionPeriod pgtype.Text                  `json:"dataRetentionPeriod"`
+	ID                  uuid.UUID                    `json:"id"`
 }
 
 func (q *Queries) UpdateTenant(ctx context.Context, db DBTX, arg UpdateTenantParams) (*Tenant, error) {
@@ -1518,6 +1523,7 @@ func (q *Queries) UpdateTenant(ctx context.Context, db DBTX, arg UpdateTenantPar
 		arg.AnalyticsOptOut,
 		arg.AlertMemberEmails,
 		arg.Version,
+		arg.DataRetentionPeriod,
 		arg.ID,
 	)
 	var i Tenant

@@ -48,6 +48,8 @@ type UpdateTenantOpts struct {
 	AlertMemberEmails *bool `validate:"omitempty"`
 
 	Version *sqlcv1.NullTenantMajorEngineVersion `validate:"omitempty"`
+
+	DataRetentionPeriod *string `validate:"omitempty,duration"`
 }
 
 type CreateTenantMemberOpts struct {
@@ -362,6 +364,10 @@ func (r *tenantRepository) UpdateTenant(ctx context.Context, id uuid.UUID, opts 
 		params.Version = *opts.Version
 	}
 
+	if opts.DataRetentionPeriod != nil {
+		params.DataRetentionPeriod = sqlchelpers.TextFromStr(*opts.DataRetentionPeriod)
+	}
+
 	updated, err := r.queries.UpdateTenant(
 		ctx,
 		r.pool,
@@ -371,6 +377,8 @@ func (r *tenantRepository) UpdateTenant(ctx context.Context, id uuid.UUID, opts 
 	if err != nil {
 		return nil, err
 	}
+
+	r.cache.Remove("api" + id.String())
 
 	for _, cb := range r.updateCallbacks {
 		cb.Do(r.l, updated)
